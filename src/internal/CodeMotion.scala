@@ -58,8 +58,16 @@ trait CodeMotion extends Scheduling {
     //val shouldOutside = e1 filter (z => (e2 contains z) || (h2 contains z))
     //*/
 
-    val levelScope = e1.filter(z => (shouldOutside contains z) && !(g1 contains z)) // shallow (but with the ordering of deep!!) and minus bound
-    
+    def isEffect(stm: Stm): Boolean = stm.rhs match {
+      case _: Reflect[_] => true
+      case _: Reify[_] => true
+      case _ => false
+    }
+    // Exact schedule with no code motion
+    val simpleSchedule = getScheduleM(e1)(result, false, false).toSet
+    val effectsThatShouldNotBeHere = e1.filter(z => isEffect(z) && !simpleSchedule.contains(z))
+    val levelScope = e1.filter(z => (shouldOutside contains z) && !(g1 contains z) && !(effectsThatShouldNotBeHere contains z)) // shallow (but with the ordering of deep!!) and minus bound
+
     // ---- end FIXME ----
 
     // sym->sym->hot->sym->cold->sym  hot --> hoist **** iff the cold is actually inside the loop ****
