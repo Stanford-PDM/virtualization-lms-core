@@ -179,6 +179,7 @@ trait ArrayLoopsMCExp extends LoopsExp with EffectExp with IfThenElseExp with Nu
   override def boundSyms(e: Any): List[Sym[Any]] = e match {
     case MultiArrayElem(y) => effectSyms(y)
     case MultiReduceElem(y, z, _, acc, vsym) => acc :: vsym :: effectSyms(y) ::: effectSyms(z)
+    case ForeachElem(y) => effectSyms(y)
 //    case SuperSingleton(y) => effectSyms(y)
     case _ => super.boundSyms(e)
   }
