@@ -24,12 +24,48 @@ trait ExportTransforms extends PPrinter {
   val IR: Expressions with Effects with FatExpressions
   import IR._
 
-  private trait JsonAble {
-    def toJson: String
+  /**
+   * Simple type class expressing the fact that a type can be serialized to json
+   */
+  private trait JsonAble[T] {
+    def toJson(elem: T): String
   }
-  private def toJsonArray(elements: TraversableOnce[JsonAble]): String = {
-    elements.map(_.toJson).mkString("[", ",", "]")
+
+  private def json[T: JsonAble](value: T): String = implicitly[JsonAble[T]].toJson(value)
+
+  private implicit def jsonAbleSeq[T: JsonAble]: JsonAble[Seq[T]] = new JsonAble[Seq[T]] {
+    val elemSerializer = implicitly[JsonAble[T]]
+    def toJson(elem: Seq[T]): String = {
+      elem.map(elemSerializer.toJson).mkString("[", ",", "]")
+    }
   }
+
+  private implicit def jsonAbleMap[K: JsonAble, V: JsonAble]: JsonAble[Map[K, V]] = new JsonAble[Map[K, V]] {
+    val keySerializer = implicitly[JsonAble[K]]
+    val valueSerializer = implicitly[JsonAble[V]]
+    def toJson(elem: Map[K, V]): String = {
+      elem.map {
+        case (key, value) => s"${keySerializer.toJson(key)}:${valueSerializer.toJson(value)}"
+      }.mkString("{", ",", "}")
+    }
+  }
+
+  private implicit def jsonAbleOpt[T: JsonAble]: JsonAble[Option[T]] = new JsonAble[Option[T]] {
+    val elemSerializer = implicitly[JsonAble[T]]
+    def toJson(elem: Option[T]): String = {
+      elem.fold("null")(elemSerializer.toJson)
+    }
+  }
+
+  private implicit object String2Json extends JsonAble[String] {
+    def toJson(elem: String): String = s""""$elem""""
+  }
+
+  private implicit object Int2Json extends JsonAble[Int] {
+    def toJson(elem: Int): String = elem.toString
+  }
+
+  private def jsonObject(elems: (String, String)*) = elems.map { case (key, value) => s"${json(key)}:$value" }.mkString("{", ",", "}")
 
   /**
    * Simpler version of scala-virtualized's SourceContext
@@ -37,58 +73,96 @@ trait ExportTransforms extends PPrinter {
    * @param line    The line number
    * @param offset  The character offset on the line
    */
-  private case class SourceLocation(file: String, line: Int, offset: Int, parent: Option[SourceLocation]) extends JsonAble {
-    def toJson: String = s"""
-    {
-      "file"    : "$file",
-      "line"    : $line,
-      "offset"  : $offset,
-      "parent"  : ${parent.map(_.toJson).getOrElse("null")}
-    }
-    """
+  private case class SourceLocation(file: String, line: Int, offset: Int)
+  private implicit object SourceLocation2Json extends JsonAble[SourceLocation] {
+    def toJson(elem: SourceLocation) = jsonObject(
+      "file" -> json(elem.file),
+      "line" -> json(elem.line),
+      "offset" -> json(elem.offset))
   }
 
   /**
-   * Semi-structured metadata that is being recorded for each statement in the IR
+   * Metadata that is being recorded for each statement in the IR
    * @param id        The id of the symbol that the statement defines
    * @param repr      A string representation of the statement
+   * @param pos       A list of the SourceContext history for this statement
    * @param comments  Additional metadata
    */
-  private case class StmInfo(id: Int, repr: String, pos: Seq[SourceLocation], comments: Seq[String], parent: Option[StmInfo], childrens: Seq[StmInfo] = Seq()) extends JsonAble {
-    def addChild(stm: StmInfo) = this.copy(childrens = childrens :+ stm)
-    def toJson: String = s"""
-      {
-        "id"        : $id,
-        "repr"      : "$repr",
-        "pos"       : ${toJsonArray(pos)},
-        "comments"  : ${comments.map(comment => s""""$comment"""").mkString("[", ",", "]")},
-        "parentId"  : ${parent.map(_.id).getOrElse("null")},
-        "childrens" : ${toJsonArray(childrens)}
-      }"""
+  private case class StmInfo(id: Int, repr: String, pos: Seq[Seq[SourceLocation]], comments: Map[String, String])
+  private implicit object StmInfo2Json extends JsonAble[StmInfo] {
+    def toJson(elem: StmInfo) = jsonObject(
+      "id" -> json(elem.id),
+      "repr" -> json(elem.repr),
+      "pos" -> json(elem.pos),
+      "comments" -> json(elem.comments))
+  }
 
+  /**
+   * Represents a scoped statement, as it was scheduled by lms
+   * @param stmId    The symbol id that this statement defines
+   * @param parent   The optional parent for this node if it is scheduled in an inneer scope
+   * @param children All the nodes in the direct inner scopes of this node
+   */
+  private case class IRNode(stmId: Int, parent: Option[IRNode], children: Seq[IRNode] = Seq.empty) {
+    def addChild(child: IRNode) = this.copy(children = this.children :+ child)
+  }
+  private implicit object IRNode2Json extends JsonAble[IRNode] {
+    def toJson(elem: IRNode) = jsonObject(
+      "stmId" -> json(elem.stmId),
+      "parent" -> json(elem.parent),
+      "children" -> json(elem.children))
   }
 
   /**
    * Represents a transformation pass
    * @param name    The name of the transformer
-   * @param before  State of the IR before transformation
-   * @param after   State of the IR after transformation
+   * @param before  Schedule before transformation
+   * @param after   Schedule after transformation
    */
-  private case class TransformInfo(name: String, before: Seq[StmInfo], after: Seq[StmInfo]) extends JsonAble {
-    def toJson: String = s"""
-    {
-      "name"    : "$name",
-      "before"  : ${toJsonArray(before)},
-      "after"   : ${toJsonArray(after)}
-    }
-    """
+  private case class TransformInfo(name: String, before: Seq[IRNode], after: Seq[IRNode])
+  private implicit object TransformInfo2Json extends JsonAble[TransformInfo] {
+    def toJson(elem: TransformInfo) = jsonObject(
+      "name" -> json(elem.name),
+      "before" -> json(elem.before),
+      "after" -> json(elem.after))
+  }
+
+  /**
+   * Represents the full trace being recorded
+   * @param transforms  The list of transformation passes that have occured
+   * @param fullGraph   The full graph with all the nodes that have been created by lms
+   */
+  private case class Trace(transforms: Seq[TransformInfo], fullGraph: Seq[StmInfo])
+  private implicit object Trace2Json extends JsonAble[Trace] {
+    def toJson(elem: Trace) = jsonObject(
+      "transforms" -> json(elem.transforms),
+      "fullGraph" -> json(elem.fullGraph))
+  }
+
+  private def toSourceLocation(srcCtx: scala.reflect.SourceContext): Seq[SourceLocation] = {
+    SourceLocation(srcCtx.fileName, srcCtx.line, srcCtx.charOffset) +: srcCtx.parent.toSeq.flatMap(toSourceLocation)
+  }
+
+  private def toStmInfo(stm: Stm): StmInfo = {
+
+    val TP(sym @ Sym(id), rhs) = stm
+
+    var comments = Map(
+      "syms" -> syms(rhs).toString,
+      "symsFreq" -> symsFreq(rhs).toString,
+      "boundSyms" -> boundSyms(rhs).toString,
+      "effectSyms" -> effectSyms(rhs).toString,
+      "readSyms" -> readSyms(rhs).toString,
+      "blocks" -> blocks(rhs).toString)
+    //s"enclosing block: ${currentBlock.value}")*/
+
+    StmInfo(id, pprint(stm), sym.pos.map(toSourceLocation), comments)
   }
 
   type Transformer = internal.AbstractTransformer { val IR: ExportTransforms.this.IR.type }
 
   private var tranformers: Seq[(String, Transformer)] = Seq.empty
   private var out: PrintStream = System.out
-  private var log: Seq[TransformInfo] = Seq.empty
 
   /** Add a transformer to the list that need to be tracked */
   def addTransform(name: String, transform: Transformer): Unit = {
@@ -114,7 +188,7 @@ trait ExportTransforms extends PPrinter {
    * exporting all of the intermediate results along the way
    */
   def run[A: Manifest](block: Block[A], format: Format = Json): Unit = {
-    log = Seq.empty
+    var transforms: Seq[TransformInfo] = Seq.empty
     val printer = new IRPrinter { val IR: ExportTransforms.this.IR.type = ExportTransforms.this.IR }
 
     var b: Block[A] = block
@@ -122,29 +196,37 @@ trait ExportTransforms extends PPrinter {
       val before = printer.run(b)
       val res = t.apply(b)
       val after = printer.run(res)
-      log :+= TransformInfo(name, before, after)
+      transforms :+= TransformInfo(name, before, after)
       b = res
     }
+    val fullGraph = globalDefs.map(toStmInfo)
 
     format match {
-      case Json => out.println(log.map(_.toJson).mkString("[", ",", "]"))
+      case Json => out.println(json(Trace(transforms, fullGraph)))
       case TextLog => {
-        def printLevel(stm: StmInfo, level: Int = 0): Unit = {
-          out.println(".." * level + stm.repr)
-          stm.childrens.foreach(printLevel(_, level + 1))
+        val stmMap = fullGraph.map(stm => stm.id -> stm).toMap
+
+        def printLevel(node: IRNode, level: Int = 0): Unit = {
+          out.println(".." * level + stmMap(node.stmId))
+          node.children.foreach(printLevel(_, level + 1))
         }
         def printTitle(title: String) = {
           out.println(title)
           out.println("=" * title.length)
         }
 
-        for (t <- log) {
+        for (t <- transforms) {
           printTitle(t.name)
           printTitle("Before")
           t.before.foreach(printLevel(_))
           printTitle("After")
           t.after.foreach(printLevel(_))
           out.println()
+        }
+
+        printTitle("Full Graph")
+        for (stm <- fullGraph) {
+          out.println(stm.repr)
         }
       }
     }
@@ -156,28 +238,14 @@ trait ExportTransforms extends PPrinter {
     import IR._
 
     private var currentBlock = new scala.util.DynamicVariable(Option.empty[Block[Any]])
-    private var currentStm = Option.empty[StmInfo]
-    private var topLevelStms = Seq.empty[StmInfo]
+    private var currentStm = Option.empty[IRNode]
+    private var topLevelStms = Seq.empty[IRNode]
 
     override def traverseStm(stm: Stm) = stm match {
       case TP(lhs, rhs) =>
-
-        var comments = Seq(
-          s"syms: ${syms(rhs)}",
-          s"symsFreq: ${symsFreq(rhs)}",
-          s"boundSyms: ${boundSyms(rhs)}",
-          s"effectSyms: ${effectSyms(rhs)}",
-          s"readSyms: ${readSyms(rhs)}",
-          s"blocks: ${blocks(rhs)}",
-          s"enclosing block: ${currentBlock.value}")
-
         var parentStm = currentStm
-        def toSourceLocation(srcCtx: scala.reflect.SourceContext): SourceLocation = {
-          val parent = srcCtx.parent.map(toSourceLocation)
-          SourceLocation(srcCtx.fileName, srcCtx.line, srcCtx.charOffset, parent)
-        }
-        val position = stm.lhs.flatMap(_.pos).map(toSourceLocation)
-        currentStm = Some(StmInfo(lhs.id, pprint(stm), position, comments, parentStm))
+
+        currentStm = Some(IRNode(lhs.id, parentStm))
 
         blocks(rhs).zipWithIndex foreach {
           case (blk, idx) =>
@@ -198,7 +266,7 @@ trait ExportTransforms extends PPrinter {
     /**
      * Traverses the whole IR and returns a semi-structured represantation
      */
-    def run[A: Manifest](block: Block[A]): Seq[StmInfo] = {
+    def run[A: Manifest](block: Block[A]): Seq[IRNode] = {
       topLevelStms = Seq.empty
       traverseBlock(block)
       topLevelStms
