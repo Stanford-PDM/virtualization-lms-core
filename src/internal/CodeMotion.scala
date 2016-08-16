@@ -133,6 +133,7 @@ trait CodeMotion extends Scheduling {
               }
             }
           }
+          error("violated ordering of effects")
         }
       case _ =>
     }
